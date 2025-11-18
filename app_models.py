@@ -6,6 +6,141 @@ Handles all input validation and data transformation.
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 import re
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, create_engine
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+import datetime
+import bcrypt
+
+Base = declarative_base()
+
+# SQLite setup for local dev
+engine = create_engine('sqlite:///literate_spoon.db', echo=False)
+SessionLocal = sessionmaker(bind=engine)
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    role = Column(String(32), default='user')
+    is_active = Column(Boolean, default=True)
+    last_login = Column(DateTime, nullable=True)
+    profile = relationship('Profile', uselist=False, back_populates='user')
+
+    def verify_password(self, password: str) -> bool:
+        return bcrypt.checkpw(password.encode('utf-8'), self.password_hash.encode('utf-8'))
+
+    @staticmethod
+    def hash_password(password: str) -> str:
+        return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+class Profile(Base):
+    __tablename__ = 'profiles'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), unique=True, nullable=False)
+    first_name = Column(String(100))
+    gender = Column(String(32))
+    zip_code = Column(String(16))
+    weight_kg = Column(String(16))
+    height_cm = Column(String(16))
+    age = Column(Integer)
+    dietary_restrictions = Column(Text)
+    budget_constraints = Column(Text)
+    diet_health_goals = Column(Text)
+    bio = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    user = relationship('User', back_populates='profile')
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "userId": self.user_id,
+            "firstName": self.first_name,
+            "gender": self.gender,
+            "zipCode": self.zip_code,
+            "weightKg": self.weight_kg,
+            "heightCm": self.height_cm,
+            "age": self.age,
+            "dietaryRestrictions": self.dietary_restrictions,
+            "budgetConstraints": self.budget_constraints,
+            "dietHealthGoals": self.diet_health_goals,
+            "bio": self.bio,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class MealPlan(Base):
+    __tablename__ = 'meal_plans'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    name = Column(String(255), nullable=False)
+    description = Column(Text)
+    meals = Column(Text)  # JSON array of meal data
+    is_active = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    user = relationship('User')
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "userId": self.user_id,
+            "name": self.name,
+            "description": self.description,
+            "meals": self.meals,
+            "isActive": self.is_active,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class GroceryList(Base):
+    __tablename__ = 'grocery_lists'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    meal_plan_id = Column(Integer, ForeignKey('meal_plans.id'), nullable=True)
+    items = Column(Text)  # JSON array of items
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    user = relationship('User')
+    meal_plan = relationship('MealPlan')
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "userId": self.user_id,
+            "mealPlanId": self.meal_plan_id,
+            "items": self.items,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ChatMessage(Base):
+    __tablename__ = 'chat_messages'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    message = Column(Text, nullable=False)
+    response = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    user = relationship('User')
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "userId": self.user_id,
+            "message": self.message,
+            "response": self.response,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
 
 
 class ValidationError(Exception):

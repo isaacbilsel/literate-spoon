@@ -1,31 +1,47 @@
-"""
-Production-ready Flask application for the recipe recommendation system.
-Main entry point for deployment on Render/Railway.
+"""Flask app entrypoint for Literate Spoon.
+
+This file wires up the Flask app, JWT helpers, DB session handling,
+and the main endpoints used by the frontend. It fixes prior issues with
+duplicated decorators and misplaced functions by providing a single
+definition for each auth endpoint.
 """
 
 import os
 import logging
 import json
-from datetime import datetime
-from flask import Flask, request, jsonify
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from dotenv import load_dotenv
-
-from app_models import UserInput, ValidationError, APIError, ExternalAPIError
+import jwt
+from app_models import (
+    UserInput,
+    ValidationError,
+    APIError,
+    ExternalAPIError,
+    User,
+    Profile,
+    MealPlan,
+    GroceryList,
+    ChatMessage,
+    SessionLocal,
+    init_db,
+)
 from app_services import GeminiService, SpoonacularService, RecipeService
 
-# Load environment variables from .env file
 load_dotenv()
+init_db()
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev_secret")
 
 # CORS configuration - configure for production
 NETLIFY_DOMAIN = os.getenv("NETLIFY_DOMAIN", "localhost:3000")
@@ -38,8 +54,8 @@ ALLOWED_ORIGINS = [
 cors_config = {
     "origins": ALLOWED_ORIGINS,
     "methods": ["GET", "POST", "OPTIONS"],
-    "allow_headers": ["Content-Type"],
-    "max_age": 3600
+    "allow_headers": ["Content-Type", "Authorization"],
+    "max_age": 3600,
 }
 CORS(app, resources={r"/api/*": cors_config})
 
@@ -48,24 +64,214 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY")
 
 if not GOOGLE_API_KEY or not SPOONACULAR_API_KEY:
-    logger.warning("Missing API keys - app may not function correctly")
+    logger.warning("Missing API keys - app may not function fully in dev")
 
 gemini_service = GeminiService(GOOGLE_API_KEY)
 spoonacular_service = SpoonacularService(SPOONACULAR_API_KEY)
 recipe_service = RecipeService(gemini_service, spoonacular_service)
 
-# Track start time for uptime
 start_time = datetime.now()
 
 
-@app.route("/health", methods=["GET"])
-def health_check():
-    """Health check endpoint for deployment monitoring."""
-    uptime_seconds = (datetime.now() - start_time).total_seconds()
+# JWT helpers
+def create_access_token(user_id, role, expires_delta=timedelta(minutes=15)):
+    payload = {
+        "user_id": user_id,
+        "role": role,
+        "exp": datetime.utcnow() + expires_delta,
+    }
+    return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
+
+
+def decode_access_token(token):
+    try:
+        return jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+
+def get_db():
+    if "db" not in g:
+        g.db = SessionLocal()
+    return g.db
+
+
+@app.teardown_appcontext
+def remove_db(exception=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def get_current_user():
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.split(" ")[1]
+    payload = decode_access_token(token)
+    if not payload:
+        return None
+    db = get_db()
+    return db.query(User).filter(User.id == payload.get("user_id")).first()
+
+
+# --- AUTH ENDPOINTS ---
+@app.route("/api/auth/register", methods=["POST"])
+def register():
+    db = get_db()
+    data = request.get_json() or {}
+    email = data.get("email")
+    password = data.get("password")
+    first_name = data.get("firstName")
+    gender = data.get("gender")
+    zip_code = data.get("zipCode")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+
+    if db.query(User).filter(User.email == email).first():
+        return jsonify({"error": "Email already exists"}), 409
+
+    password_hash = User.hash_password(password)
+    user = User(email=email, password_hash=password_hash)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    # create profile if provided
+    profile = Profile(user_id=user.id, first_name=first_name, gender=gender, zip_code=zip_code)
+    db.add(profile)
+    db.commit()
+
+    access_token = create_access_token(user.id, user.role)
+    return (
+        jsonify({
+            "user": {"id": user.id, "email": user.email},
+            "accessToken": access_token,
+            "refreshTokenSetCookie": False,
+        }),
+        201,
+    )
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    db = get_db()
+    data = request.get_json() or {}
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not user.verify_password(password):
+        return jsonify({"error": "Incorrect credentials"}), 401
+
+    access_token = create_access_token(user.id, user.role)
+    user.last_login = datetime.utcnow()
+    db.commit()
+
+    return (
+        jsonify({
+            "user": {"id": user.id, "email": user.email},
+            "accessToken": access_token,
+            "refreshTokenSetCookie": False,
+        }),
+        200,
+    )
+
+
+@app.route("/api/auth/me", methods=["GET"])
+def get_current_user_info():
+    """Get current authenticated user's info."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    profile = db.query(Profile).filter(Profile.user_id == user.id).first()
+    
     return jsonify({
-        "status": "ok",
-        "uptime_seconds": int(uptime_seconds),
-        "timestamp": datetime.now().isoformat()
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "role": user.role,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        },
+        "profile": profile.to_dict() if profile else None,
+    }), 200
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    """Logout endpoint (JWT is stateless, so this is mainly for frontend)."""
+    return jsonify({"message": "Logged out successfully"}), 200
+
+
+@app.route("/api/auth/refresh", methods=["POST"])
+def refresh_token():
+    """Refresh access token using current JWT."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    new_access_token = create_access_token(user.id, user.role)
+    return jsonify({
+        "accessToken": new_access_token,
+        "refreshTokenSetCookie": False,
+    }), 200
+
+
+# --- PROFILE ENDPOINTS ---
+@app.route("/api/profile", methods=["GET"])
+def get_profile():
+    """Get user profile."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    profile = db.query(Profile).filter(Profile.user_id == user.id).first()
+    if not profile:
+        return jsonify({"error": "Profile not found"}), 404
+    
+    return jsonify(profile.to_dict()), 200
+
+
+@app.route("/api/profile", methods=["PUT", "PATCH"])
+def update_profile():
+    """Update user profile."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    profile = db.query(Profile).filter(Profile.user_id == user.id).first()
+    if not profile:
+        return jsonify({"error": "Profile not found"}), 404
+    
+    data = request.get_json() or {}
+    
+    # Update allowed fields
+    if "firstName" in data:
+        profile.first_name = data["firstName"]
+    if "gender" in data:
+        profile.gender = data["gender"]
+    if "zipCode" in data:
+        profile.zip_code = data["zipCode"]
+    if "bio" in data:
+        profile.bio = data["bio"]
+    if "dietaryRestrictions" in data:
+        profile.dietary_restrictions = data["dietaryRestrictions"]
+    
+    db.commit()
+    
+    return jsonify({
+        "message": "Profile updated successfully",
+        "profile": profile.to_dict(),
     }), 200
 
 
@@ -151,6 +357,298 @@ def get_recipes():
 def handle_preflight():
     """Handle CORS preflight requests."""
     return "", 200
+
+
+# --- MEAL PLAN ENDPOINTS ---
+@app.route("/api/meal-plans", methods=["GET"])
+def list_meal_plans():
+    """List all meal plans for authenticated user."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    meal_plans = db.query(MealPlan).filter(MealPlan.user_id == user.id).all()
+    
+    return jsonify({
+        "meal_plans": [mp.to_dict() for mp in meal_plans]
+    }), 200
+
+
+@app.route("/api/meal-plans", methods=["POST"])
+def create_meal_plan():
+    """Create a new meal plan."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    data = request.get_json() or {}
+    
+    meal_plan = MealPlan(
+        user_id=user.id,
+        name=data.get("name", "Untitled Meal Plan"),
+        description=data.get("description", ""),
+        meals=data.get("meals", "[]"),
+    )
+    db.add(meal_plan)
+    db.commit()
+    
+    return jsonify({
+        "message": "Meal plan created",
+        "meal_plan": meal_plan.to_dict(),
+    }), 201
+
+
+@app.route("/api/meal-plans/<int:meal_plan_id>", methods=["GET"])
+def get_meal_plan(meal_plan_id):
+    """Get a specific meal plan."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    meal_plan = db.query(MealPlan).filter(
+        MealPlan.id == meal_plan_id,
+        MealPlan.user_id == user.id
+    ).first()
+    
+    if not meal_plan:
+        return jsonify({"error": "Meal plan not found"}), 404
+    
+    return jsonify(meal_plan.to_dict()), 200
+
+
+@app.route("/api/meal-plans/<int:meal_plan_id>", methods=["PUT", "PATCH"])
+def update_meal_plan(meal_plan_id):
+    """Update a meal plan."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    meal_plan = db.query(MealPlan).filter(
+        MealPlan.id == meal_plan_id,
+        MealPlan.user_id == user.id
+    ).first()
+    
+    if not meal_plan:
+        return jsonify({"error": "Meal plan not found"}), 404
+    
+    data = request.get_json() or {}
+    
+    if "name" in data:
+        meal_plan.name = data["name"]
+    if "description" in data:
+        meal_plan.description = data["description"]
+    if "meals" in data:
+        meal_plan.meals = data["meals"]
+    
+    db.commit()
+    
+    return jsonify({
+        "message": "Meal plan updated",
+        "meal_plan": meal_plan.to_dict(),
+    }), 200
+
+
+@app.route("/api/meal-plans/<int:meal_plan_id>/activate", methods=["POST"])
+def activate_meal_plan(meal_plan_id):
+    """Activate a meal plan."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    meal_plan = db.query(MealPlan).filter(
+        MealPlan.id == meal_plan_id,
+        MealPlan.user_id == user.id
+    ).first()
+    
+    if not meal_plan:
+        return jsonify({"error": "Meal plan not found"}), 404
+    
+    # Deactivate all other meal plans
+    db.query(MealPlan).filter(
+        MealPlan.user_id == user.id,
+        MealPlan.id != meal_plan_id
+    ).update({"is_active": False})
+    
+    meal_plan.is_active = True
+    db.commit()
+    
+    return jsonify({
+        "message": "Meal plan activated",
+        "meal_plan": meal_plan.to_dict(),
+    }), 200
+
+
+@app.route("/api/meal-plans/<int:meal_plan_id>/grocery-list", methods=["GET"])
+def get_meal_plan_grocery_list(meal_plan_id):
+    """Get grocery list for a meal plan."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    grocery_list = db.query(GroceryList).filter(
+        GroceryList.meal_plan_id == meal_plan_id,
+        GroceryList.user_id == user.id
+    ).first()
+    
+    if not grocery_list:
+        return jsonify({"error": "Grocery list not found"}), 404
+    
+    return jsonify(grocery_list.to_dict()), 200
+
+
+# --- GROCERY LIST ENDPOINTS ---
+@app.route("/api/grocery-lists", methods=["GET"])
+def list_grocery_lists():
+    """List all grocery lists for authenticated user."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    grocery_lists = db.query(GroceryList).filter(GroceryList.user_id == user.id).all()
+    
+    return jsonify({
+        "grocery_lists": [gl.to_dict() for gl in grocery_lists]
+    }), 200
+
+
+@app.route("/api/grocery-lists", methods=["POST"])
+def create_grocery_list():
+    """Create a new grocery list."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    data = request.get_json() or {}
+    
+    grocery_list = GroceryList(
+        user_id=user.id,
+        meal_plan_id=data.get("mealPlanId"),
+        items=data.get("items", "[]"),
+    )
+    db.add(grocery_list)
+    db.commit()
+    
+    return jsonify({
+        "message": "Grocery list created",
+        "grocery_list": grocery_list.to_dict(),
+    }), 201
+
+
+@app.route("/api/grocery-lists/<int:grocery_list_id>", methods=["GET"])
+def get_grocery_list(grocery_list_id):
+    """Get a specific grocery list."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    grocery_list = db.query(GroceryList).filter(
+        GroceryList.id == grocery_list_id,
+        GroceryList.user_id == user.id
+    ).first()
+    
+    if not grocery_list:
+        return jsonify({"error": "Grocery list not found"}), 404
+    
+    return jsonify(grocery_list.to_dict()), 200
+
+
+@app.route("/api/grocery-lists/<int:grocery_list_id>", methods=["PUT", "PATCH"])
+def update_grocery_list(grocery_list_id):
+    """Update a grocery list."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    grocery_list = db.query(GroceryList).filter(
+        GroceryList.id == grocery_list_id,
+        GroceryList.user_id == user.id
+    ).first()
+    
+    if not grocery_list:
+        return jsonify({"error": "Grocery list not found"}), 404
+    
+    data = request.get_json() or {}
+    
+    if "items" in data:
+        grocery_list.items = data["items"]
+    
+    db.commit()
+    
+    return jsonify({
+        "message": "Grocery list updated",
+        "grocery_list": grocery_list.to_dict(),
+    }), 200
+
+
+# --- CHAT ENDPOINTS ---
+@app.route("/api/chat/parse", methods=["POST"])
+def parse_chat():
+    """Parse user chat message and return response."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    data = request.get_json() or {}
+    message = data.get("message", "")
+    
+    if not message:
+        return jsonify({"error": "Message required"}), 400
+    
+    # Simple placeholder response
+    response = f"I received your message: '{message}'. How can I help with your meal plan?"
+    
+    # Store chat message
+    chat_msg = ChatMessage(
+        user_id=user.id,
+        message=message,
+        response=response,
+    )
+    db.add(chat_msg)
+    db.commit()
+    
+    return jsonify({
+        "message": message,
+        "response": response,
+        "chat_id": chat_msg.id,
+    }), 200
+
+
+@app.route("/api/chat/history", methods=["GET"])
+def get_chat_history():
+    """Get chat history for authenticated user."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    messages = db.query(ChatMessage).filter(ChatMessage.user_id == user.id).all()
+    
+    return jsonify({
+        "chat_history": [msg.to_dict() for msg in messages]
+    }), 200
+
+
+# --- UTILITY ENDPOINTS ---
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint for deployment monitoring."""
+    uptime_seconds = (datetime.now() - start_time).total_seconds()
+    return jsonify({
+        "status": "ok",
+        "uptime_seconds": int(uptime_seconds),
+        "timestamp": datetime.now().isoformat()
+    }), 200
 
 
 @app.errorhandler(400)
