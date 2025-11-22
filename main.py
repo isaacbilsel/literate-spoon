@@ -26,8 +26,11 @@ from app_models import (
     ChatMessage,
     SessionLocal,
     init_db,
+    GeneratedMealPlan,
+    DayMeals,
+    Meal,
 )
-from app_services import GeminiService, SpoonacularService, RecipeService
+from app_services import GeminiService, SpoonacularService, RecipeService, MealPlanService
 
 load_dotenv()
 init_db()
@@ -44,16 +47,10 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev_secret")
 
 # CORS configuration - configure for production
-NETLIFY_DOMAIN = os.getenv("NETLIFY_DOMAIN", "localhost:3000")
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5001",
-    f"https://{NETLIFY_DOMAIN}",
-]
-
+CORS_METHODS = ["GET", "POST", "PUT", "PATCH", "OPTIONS"]
 cors_config = {
-    "origins": ALLOWED_ORIGINS,
-    "methods": ["GET", "POST", "OPTIONS"],
+    "origins": "*",
+    "methods": CORS_METHODS,
     "allow_headers": ["Content-Type", "Authorization"],
     "max_age": 3600,
 }
@@ -69,12 +66,16 @@ if not GOOGLE_API_KEY or not SPOONACULAR_API_KEY:
 gemini_service = GeminiService(GOOGLE_API_KEY)
 spoonacular_service = SpoonacularService(SPOONACULAR_API_KEY)
 recipe_service = RecipeService(gemini_service, spoonacular_service)
+meal_plan_service = MealPlanService(gemini_service, spoonacular_service)
 
 start_time = datetime.now()
 
 
 # JWT helpers
-def create_access_token(user_id, role, expires_delta=timedelta(minutes=15)):
+def create_access_token(user_id, role, expires_delta=None):
+    # Default expiration: 2 days (if not provided)
+    if expires_delta is None:
+        expires_delta = timedelta(days=2)
     payload = {
         "user_id": user_id,
         "role": role,
@@ -266,6 +267,16 @@ def update_profile():
         profile.bio = data["bio"]
     if "dietaryRestrictions" in data:
         profile.dietary_restrictions = data["dietaryRestrictions"]
+    if "height_cm" in data:
+        profile.height_cm = data["height_cm"]
+    if "weight_kg" in data:
+        profile.weight_kg = data["weight_kg"]
+    if "allergies" in data:
+        profile.allergies = json.dumps(data["allergies"])
+    if "food_preferences" in data:
+        profile.food_preferences = data["food_preferences"]
+    if "diet_goals" in data:
+        profile.diet_goals = data["diet_goals"]
     
     db.commit()
     
@@ -389,7 +400,7 @@ def create_meal_plan():
         user_id=user.id,
         name=data.get("name", "Untitled Meal Plan"),
         description=data.get("description", ""),
-        meals=data.get("meals", "[]"),
+        meals=json.dumps(data.get("meals", [])),  # Serialize meals to JSON
     )
     db.add(meal_plan)
     db.commit()
@@ -442,7 +453,7 @@ def update_meal_plan(meal_plan_id):
     if "description" in data:
         meal_plan.description = data["description"]
     if "meals" in data:
-        meal_plan.meals = data["meals"]
+        meal_plan.meals = json.dumps(data["meals"])
     
     db.commit()
     
@@ -502,6 +513,167 @@ def get_meal_plan_grocery_list(meal_plan_id):
     return jsonify(grocery_list.to_dict()), 200
 
 
+@app.route("/api/meal-plans/generate", methods=["POST"])
+def generate_meal_plan():
+    """Generate a new AI-powered meal plan based on user preferences and budget."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    try:
+        db = get_db()
+        data = request.get_json() or {}
+        
+        # Get user's profile for personalized recommendations
+        profile = db.query(Profile).filter(Profile.user_id == user.id).first()
+        
+        # Extract parameters from request
+        budget = data.get("budget", 100.0)  # Default weekly budget
+        allergies = data.get("allergies", [])
+        diet_goals = data.get("dietGoals", "")
+        food_preferences = data.get("foodPreferences", "")
+        target_calories = data.get("targetCalories", 2000)
+        
+        # Use profile data if available and not overridden
+        if profile:
+            if not allergies and profile.allergies:
+                try:
+                    allergies = json.loads(profile.allergies)
+                except Exception:
+                    allergies = []
+            
+            if not diet_goals and profile.diet_goals:
+                diet_goals = profile.diet_goals
+                
+            if not food_preferences and profile.food_preferences:
+                food_preferences = profile.food_preferences
+        
+        # Validate required parameters
+        if not diet_goals:
+            return jsonify({
+                "error": "Diet goals are required. Please specify your dietary objectives."
+            }), 400
+        
+        if budget <= 0:
+            return jsonify({
+                "error": "Budget must be a positive number."
+            }), 400
+        
+        logger.info(f"Generating meal plan for user {user.id} - Budget: ${budget}, Diet goals: {diet_goals}")
+        
+        # Generate the meal plan using AI
+        generated_meal_plan = meal_plan_service.generate_weekly_meal_plan(
+            budget=budget,
+            allergies=allergies,
+            diet_goals=diet_goals,
+            food_preferences=food_preferences,
+            target_calories_per_day=target_calories
+        )
+        
+        # Optionally save to database as a regular MealPlan
+        if data.get("saveToDatabase", True):
+            meal_plan_db = MealPlan(
+                user_id=user.id,
+                name=generated_meal_plan.name,
+                description=f"AI-generated meal plan for budget ${budget}/week with goals: {diet_goals}",
+                meals=json.dumps(generated_meal_plan.to_dict())
+            )
+            db.add(meal_plan_db)
+            db.commit()
+            
+            # Update the generated meal plan ID to match the database ID
+            generated_meal_plan.id = str(meal_plan_db.id)
+        
+        logger.info(f"Successfully generated meal plan with {len(generated_meal_plan.days)} days")
+        
+        return jsonify({
+            "success": True,
+            "meal_plan": generated_meal_plan.to_dict()
+        }), 200
+        
+    except ExternalAPIError as e:
+        logger.error(f"External API error during meal plan generation: {e.message}")
+        return jsonify({
+            "success": False,
+            "error": e.message,
+            "type": "external_api_error"
+        }), 500
+        
+    except Exception as e:
+        logger.exception(f"Unexpected error in meal plan generation: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": "Internal server error during meal plan generation",
+            "type": "internal_error"
+        }), 500
+
+
+@app.route("/api/meal-plans/generated", methods=["GET"])
+def get_generated_meal_plans():
+    """Get all AI-generated meal plans for authenticated user."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    try:
+        db = get_db()
+        
+        # Query meal plans that contain AI-generated data (indicated by description containing "AI-generated")
+        meal_plans = db.query(MealPlan).filter(
+            MealPlan.user_id == user.id,
+            MealPlan.description.contains("AI-generated")
+        ).order_by(MealPlan.created_at.desc()).all()
+        
+        generated_meal_plans = []
+        
+        for meal_plan in meal_plans:
+            try:
+                # Parse the stored JSON data which contains the full GeneratedMealPlan structure
+                if meal_plan.meals:
+                    meal_data = json.loads(meal_plan.meals)
+                    
+                    # If it's a nested structure (GeneratedMealPlan was stored as JSON), extract it
+                    if isinstance(meal_data, dict) and 'id' in meal_data and 'days' in meal_data:
+                        # This is a full GeneratedMealPlan object
+                        generated_meal_plans.append(meal_data)
+                    else:
+                        # This might be a regular meal plan, convert to GeneratedMealPlan format
+                        generated_meal_plans.append({
+                            "id": str(meal_plan.id),
+                            "name": meal_plan.name,
+                            "description": meal_plan.description,
+                            "startDate": meal_plan.created_at.strftime("%Y-%m-%d") if meal_plan.created_at else "",
+                            "endDate": "",
+                            "isActive": meal_plan.is_active,
+                            "days": meal_data if isinstance(meal_data, list) else [],
+                            "weeklyBudget": 0.0,
+                            "totalCalories": 0,
+                            "totalProtein": 0.0,
+                            "totalCarbs": 0.0,
+                            "totalFat": 0.0
+                        })
+                        
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse meal plan {meal_plan.id} data: {e}")
+                continue
+        
+        logger.info(f"Retrieved {len(generated_meal_plans)} generated meal plans for user {user.id}")
+        
+        return jsonify({
+            "success": True,
+            "count": len(generated_meal_plans),
+            "meal_plans": generated_meal_plans
+        }), 200
+        
+    except Exception as e:
+        logger.exception(f"Unexpected error retrieving generated meal plans: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": "Internal server error retrieving meal plans",
+            "type": "internal_error"
+        }), 500
+
+
 # --- GROCERY LIST ENDPOINTS ---
 @app.route("/api/grocery-lists", methods=["GET"])
 def list_grocery_lists():
@@ -531,7 +703,7 @@ def create_grocery_list():
     grocery_list = GroceryList(
         user_id=user.id,
         meal_plan_id=data.get("mealPlanId"),
-        items=data.get("items", "[]"),
+        items=json.dumps(data.get("items", [])) if isinstance(data.get("items"), list) else data.get("items", "[]"),
     )
     db.add(grocery_list)
     db.commit()
@@ -580,7 +752,7 @@ def update_grocery_list(grocery_list_id):
     data = request.get_json() or {}
     
     if "items" in data:
-        grocery_list.items = data["items"]
+        grocery_list.items = json.dumps(data["items"]) if isinstance(data["items"], list) else data["items"]
     
     db.commit()
     
@@ -685,7 +857,7 @@ if __name__ == "__main__":
     debug = os.getenv("FLASK_ENV", "production") == "development"
     
     logger.info(f"Starting Flask app on port {port} (debug={debug})")
-    logger.info(f"CORS allowed origins: {ALLOWED_ORIGINS}")
+    logger.info("CORS allowed origins: * (all sites)")
     logger.info(f"Gemini API: {'configured' if GOOGLE_API_KEY else 'NOT SET'}")
     logger.info(f"Spoonacular API: {'configured' if SPOONACULAR_API_KEY else 'NOT SET'}")
     

@@ -9,7 +9,7 @@ import requests
 from google import genai
 from app_models import (
     UserInput, UserMetrics, Recipe, RecipeNutrition, RecipePricing,
-    ValidationError, ExternalAPIError
+    ValidationError, ExternalAPIError, GeneratedMealPlan, DayMeals, Meal
 )
 
 logger = logging.getLogger(__name__)
@@ -365,3 +365,207 @@ class RecipeService:
         logger.info(f"Returning {len(final_recipes)} recipes")
         
         return parsed_ingredients, final_recipes, metrics
+
+
+class MealPlanService:
+    """Service for generating AI-powered meal plans."""
+    
+    def __init__(self, gemini_service: GeminiService, spoonacular_service: SpoonacularService):
+        self.gemini_service = gemini_service
+        self.spoonacular_service = spoonacular_service
+    
+    def generate_weekly_meal_plan(
+        self,
+        budget: float,
+        allergies: List[str],
+        diet_goals: str,
+        food_preferences: str = "",
+        target_calories_per_day: int = 2000
+    ) -> GeneratedMealPlan:
+        """
+        Generate a complete weekly meal plan using Gemini AI and Spoonacular.
+        
+        Args:
+            budget: Weekly budget for meals
+            allergies: List of allergens to exclude
+            diet_goals: User's dietary objectives
+            food_preferences: User's food preferences
+            target_calories_per_day: Target daily calories
+            
+        Returns:
+            GeneratedMealPlan object with structured meal data
+            
+        Raises:
+            ExternalAPIError: If API calls fail
+        """
+        try:
+            import json
+            from datetime import datetime, timedelta
+            import uuid
+            
+            # Create the Gemini prompt for meal plan generation
+            allergy_str = ", ".join(allergies) if allergies else "none"
+            daily_budget = budget / 7  # Distribute weekly budget across 7 days
+            
+            prompt = f"""You are an expert meal planning nutritionist. Create a 7-day meal plan with the following constraints:
+
+Weekly Budget: ${budget:.2f} (approximately ${daily_budget:.2f} per day)
+Allergies to EXCLUDE: {allergy_str}
+Diet Goals: {diet_goals}
+Food Preferences: {food_preferences or "none specified"}
+Target Calories per Day: {target_calories_per_day}
+
+Create a JSON response with this EXACT structure:
+{{
+  "days": [
+    {{
+      "day": "Monday",
+      "breakfast": {{
+        "name": "meal name",
+        "description": "brief description",
+        "calories": 400,
+        "protein": 20.5,
+        "carbs": 45.0,
+        "fat": 15.0
+      }},
+      "lunch": {{
+        "name": "meal name",
+        "description": "brief description", 
+        "calories": 600,
+        "protein": 30.0,
+        "carbs": 60.0,
+        "fat": 20.0
+      }},
+      "dinner": {{
+        "name": "meal name",
+        "description": "brief description",
+        "calories": 800,
+        "protein": 40.0,
+        "carbs": 80.0,
+        "fat": 25.0
+      }},
+      "snacks": [
+        {{
+          "name": "snack name",
+          "description": "brief description",
+          "calories": 200,
+          "protein": 10.0,
+          "carbs": 20.0,
+          "fat": 8.0
+        }}
+      ]
+    }}
+  ]
+}}
+
+Requirements:
+1. NEVER include {allergy_str} ingredients
+2. Each meal should be realistic and achievable within the budget
+3. Meals should align with the diet goals: {diet_goals}
+4. Total daily calories should be close to {target_calories_per_day}
+5. Include all 7 days: Monday through Sunday
+6. Provide realistic nutritional values
+7. Return ONLY valid JSON, no additional text
+
+Generate the meal plan now:"""
+
+            # Get meal plan from Gemini
+            chat = self.gemini_service.client.chats.create(model=self.gemini_service.model)
+            response = chat.send_message(prompt)
+            
+            # Parse the JSON response
+            try:
+                meal_plan_data = json.loads(response.text.strip())
+            except json.JSONDecodeError:
+                # Try to extract JSON from the response if it's wrapped in text
+                import re
+                json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
+                if json_match:
+                    meal_plan_data = json.loads(json_match.group())
+                else:
+                    raise ExternalAPIError("Gemini returned invalid JSON format")
+            
+            # Convert to our data structures
+            days = []
+            total_weekly_calories = 0
+            
+            for day_data in meal_plan_data.get("days", []):
+                # Create meals
+                breakfast = Meal(
+                    name=day_data["breakfast"]["name"],
+                    description=day_data["breakfast"].get("description"),
+                    calories=day_data["breakfast"].get("calories"),
+                    protein=day_data["breakfast"].get("protein"),
+                    carbs=day_data["breakfast"].get("carbs"),
+                    fat=day_data["breakfast"].get("fat")
+                )
+                
+                lunch = Meal(
+                    name=day_data["lunch"]["name"],
+                    description=day_data["lunch"].get("description"),
+                    calories=day_data["lunch"].get("calories"),
+                    protein=day_data["lunch"].get("protein"),
+                    carbs=day_data["lunch"].get("carbs"),
+                    fat=day_data["lunch"].get("fat")
+                )
+                
+                dinner = Meal(
+                    name=day_data["dinner"]["name"],
+                    description=day_data["dinner"].get("description"),
+                    calories=day_data["dinner"].get("calories"),
+                    protein=day_data["dinner"].get("protein"),
+                    carbs=day_data["dinner"].get("carbs"),
+                    fat=day_data["dinner"].get("fat")
+                )
+                
+                # Handle snacks
+                snacks = []
+                if "snacks" in day_data and day_data["snacks"]:
+                    for snack_data in day_data["snacks"]:
+                        snack = Meal(
+                            name=snack_data["name"],
+                            description=snack_data.get("description"),
+                            calories=snack_data.get("calories"),
+                            protein=snack_data.get("protein"),
+                            carbs=snack_data.get("carbs"),
+                            fat=snack_data.get("fat")
+                        )
+                        snacks.append(snack)
+                
+                # Create day meals
+                day_meals = DayMeals(
+                    day=day_data["day"],
+                    breakfast=breakfast,
+                    lunch=lunch,
+                    dinner=dinner,
+                    snacks=snacks if snacks else None
+                )
+                
+                days.append(day_meals)
+                
+                # Calculate daily calories
+                day_calories = (breakfast.calories or 0) + (lunch.calories or 0) + (dinner.calories or 0)
+                day_calories += sum(snack.calories or 0 for snack in snacks)
+                total_weekly_calories += day_calories
+            
+            # Create the final meal plan
+            start_date = datetime.now()
+            end_date = start_date + timedelta(days=6)
+            
+            meal_plan = GeneratedMealPlan(
+                id=str(uuid.uuid4()),
+                name=f"AI Generated Meal Plan - {start_date.strftime('%Y-%m-%d')}",
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat(),
+                is_current=True,
+                days=days,
+                total_calories=total_weekly_calories,
+                created_at=datetime.now().isoformat()
+            )
+            
+            logger.info(f"Generated meal plan with {len(days)} days, total calories: {total_weekly_calories}")
+            return meal_plan
+            
+        except Exception as e:
+            logger.error(f"Meal plan generation error: {str(e)}")
+            raise ExternalAPIError(f"Failed to generate meal plan: {str(e)}")

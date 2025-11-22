@@ -43,31 +43,38 @@ class Profile(Base):
     first_name = Column(String(100))
     gender = Column(String(32))
     zip_code = Column(String(16))
-    weight_kg = Column(String(16))
-    height_cm = Column(String(16))
     age = Column(Integer)
     dietary_restrictions = Column(Text)
     budget_constraints = Column(Text)
     diet_health_goals = Column(Text)
     bio = Column(Text)
+    height_cm = Column(Integer)
+    weight_kg = Column(Integer)
+    allergies = Column(Text)  # store as JSON string
+    food_preferences = Column(Text)
+    diet_goals = Column(Text)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
     user = relationship('User', back_populates='profile')
 
     def to_dict(self):
+        import json
         return {
             "id": self.id,
             "userId": self.user_id,
             "firstName": self.first_name,
             "gender": self.gender,
             "zipCode": self.zip_code,
-            "weightKg": self.weight_kg,
-            "heightCm": self.height_cm,
             "age": self.age,
             "dietaryRestrictions": self.dietary_restrictions,
             "budgetConstraints": self.budget_constraints,
             "dietHealthGoals": self.diet_health_goals,
             "bio": self.bio,
+            "height_cm": self.height_cm,
+            "weight_kg": self.weight_kg,
+            "allergies": json.loads(self.allergies) if self.allergies else [],
+            "food_preferences": self.food_preferences,
+            "diet_goals": self.diet_goals,
             "createdAt": self.created_at.isoformat() if self.created_at else None,
             "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -77,21 +84,32 @@ class MealPlan(Base):
     __tablename__ = 'meal_plans'
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    name = Column(String(255), nullable=False)
-    description = Column(Text)
-    meals = Column(Text)  # JSON array of meal data
-    is_active = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    height_cm = Column(Integer)
+    weight_kg = Column(Integer)
+    allergies = Column(Text)  # store as JSON string
+    food_preferences = Column(Text)
+    diet_goals = Column(Text)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
     user = relationship('User')
 
+    name = Column(String, nullable=False)
+    description = Column(Text)
+    meals = Column(Text)  # JSON array of meals
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
     def to_dict(self):
+        import json
+        try:
+            meals = json.loads(self.meals) if self.meals else []
+        except Exception:
+            meals = []
         return {
             "id": self.id,
             "userId": self.user_id,
             "name": self.name,
             "description": self.description,
-            "meals": self.meals,
+            "meals": meals,
             "isActive": self.is_active,
             "createdAt": self.created_at.isoformat() if self.created_at else None,
             "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
@@ -110,11 +128,16 @@ class GroceryList(Base):
     meal_plan = relationship('MealPlan')
 
     def to_dict(self):
+        import json
+        try:
+            items = json.loads(self.items) if self.items else []
+        except Exception:
+            items = []
         return {
             "id": self.id,
             "userId": self.user_id,
             "mealPlanId": self.meal_plan_id,
-            "items": self.items,
+            "items": items,
             "createdAt": self.created_at.isoformat() if self.created_at else None,
             "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -458,3 +481,72 @@ class APIError(Exception):
 class ExternalAPIError(APIError):
     """Exception for external API (Gemini, Spoonacular) failures."""
     pass
+
+
+@dataclass
+class Meal:
+    """Represents a single meal with nutritional information."""
+    name: str
+    description: Optional[str] = None
+    calories: Optional[int] = None
+    protein: Optional[float] = None
+    carbs: Optional[float] = None
+    fat: Optional[float] = None
+    recipe_id: Optional[int] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "calories": self.calories,
+            "protein": self.protein,
+            "carbs": self.carbs,
+            "fat": self.fat,
+            "recipeId": self.recipe_id
+        }
+
+
+@dataclass
+class DayMeals:
+    """Represents meals for a single day."""
+    day: str
+    breakfast: Meal
+    lunch: Meal
+    dinner: Meal
+    snacks: Optional[List[Meal]] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "day": self.day,
+            "breakfast": self.breakfast.to_dict(),
+            "lunch": self.lunch.to_dict(),
+            "dinner": self.dinner.to_dict()
+        }
+        if self.snacks:
+            result["snacks"] = [snack.to_dict() for snack in self.snacks]
+        return result
+
+
+@dataclass
+class GeneratedMealPlan:
+    """Represents a complete generated meal plan."""
+    id: str
+    name: str
+    start_date: str
+    end_date: str
+    is_current: bool
+    days: List[DayMeals]
+    total_calories: Optional[int] = None
+    created_at: str = ""
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "startDate": self.start_date,
+            "endDate": self.end_date,
+            "isCurrent": self.is_current,
+            "days": [day.to_dict() for day in self.days],
+            "totalCalories": self.total_calories,
+            "createdAt": self.created_at
+        }
